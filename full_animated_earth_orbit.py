@@ -1,12 +1,12 @@
 import streamlit as st
+from datetime import datetime
 import os
 import math
 import random
 import numpy as np
-import requests
-from datetime import datetime
+import requests, json
 
-# Astropy / Poliastro imports
+# Poliastro / Astropy imports
 from astropy import units as u
 from astropy.time import Time
 from poliastro.bodies import Earth
@@ -16,25 +16,50 @@ from poliastro.iod import izzo
 # SGP4 imports
 from sgp4.api import Satrec, jday
 
-# Plotly for interactive 3D
+# Plotly for interactive 3D figures
 import plotly.graph_objects as go
 
-# ============================
-# GLOBAL SETTINGS and API URLs
-# ============================
+# -------------------------------------------------------------------
+# 1. Streamlit Page Config
+# -------------------------------------------------------------------
+st.set_page_config(page_title="Debris & Satellite Simulation (Interactive)", layout="wide")
+
+# -------------------------------------------------------------------
+# 2. Main Header Title (Centered)
+# -------------------------------------------------------------------
+st.markdown(
+    "<h1 style='text-align: left;'> Autonomous Debris Removal & Satellite Launch </h1>", 
+    unsafe_allow_html=True
+)
+
+# -------------------------------------------------------------------
+# 3. Sidebar: Logo at Top (Medium Size) and Satellite Launch Parameters
+# -------------------------------------------------------------------
+# Make sure logo_main.png is in the same directory as this script
+logo_path = os.path.join(os.path.dirname(__file__), "logo_main.png")
+
+# Remove deprecated use_column_width and specify a fixed width for medium size
+st.sidebar.image(logo_path, width=270)
+
+st.sidebar.header("Satellite Launch Parameters")
+lat_input = st.sidebar.text_input("Launch Latitude (°)", "28.5")
+lon_input = st.sidebar.text_input("Launch Longitude (°)", "-80.6")
+alt_input = st.sidebar.text_input("Launch Altitude (km)", "500")
+
+# -------------------------------------------------------------------
+# 4. Global URLs and Constants
+# -------------------------------------------------------------------
 DEBRIS_TLE_URL = "https://celestrak.org/NORAD/elements/supplemental/sup-gp.php?CATNR=25544&FORMAT=TLE"
 ISS_TLE_URL    = "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=TLE"
 MAX_OBJECTS = 500
 
-# If you have a texture file, you can still do a color-coded sphere in Plotly. 
-# We'll keep it simple by coloring Earth with a built-in colorscale for now.
+USE_TEXTURED_EARTH = True
+EARTH_TEXTURE_FILE = "earth_texture.jpg"  # Replace if needed
 
-# ============================
-# Helper Functions
-# ============================
-
+# -------------------------------------------------------------------
+# 5. Helper Functions
+# -------------------------------------------------------------------
 def ai_detect_debris_size(image_path):
-    # Simulated AI detection. Quietly returns random size [0.5..2.0].
     return random.uniform(0.5, 2.0)
 
 def fetch_tle_data(url):
@@ -57,7 +82,7 @@ def fetch_debris_tle():
         resp.raise_for_status()
         lines = resp.text.strip().splitlines()
         for i in range(0, len(lines), 3):
-            if i + 2 < len(lines):
+            if i+2 < len(lines):
                 name = lines[i].strip()
                 line1 = lines[i+1].strip()
                 line2 = lines[i+2].strip()
@@ -82,9 +107,11 @@ def assign_debris_size_and_criticality(debris_list):
 def create_orbit_from_tle(debris, epoch):
     try:
         sat = Satrec.twoline2rv(debris["line1"], debris["line2"])
-        jd, fr = jday(epoch.datetime.year, epoch.datetime.month, epoch.datetime.day,
-                      epoch.datetime.hour, epoch.datetime.minute,
-                      epoch.datetime.second + epoch.datetime.microsecond*1e-6)
+        jd, fr = jday(
+            epoch.datetime.year, epoch.datetime.month, epoch.datetime.day,
+            epoch.datetime.hour, epoch.datetime.minute,
+            epoch.datetime.second + epoch.datetime.microsecond*1e-6
+        )
         e, r, v = sat.sgp4(jd, fr)
         if e != 0:
             st.warning(f"[WARN] sgp4 error for {debris['name']}: code {e}")
@@ -94,7 +121,7 @@ def create_orbit_from_tle(debris, epoch):
         orbit = Orbit.from_vectors(Earth, r, v, epoch=epoch)
         return orbit
     except Exception as ex:
-        st.error(f"[ERROR] Creating orbit from TLE for {debris['name']}: {ex}")
+        st.error(f"[ERROR] Creating orbit for {debris['name']}: {ex}")
         return None
 
 def compute_transfer_orbit(iss_orbit, debris_orbit, departure_time, arrival_time):
@@ -105,7 +132,7 @@ def compute_transfer_orbit(iss_orbit, debris_orbit, departure_time, arrival_time
 
 def simulate_mission(debris_list, log_func=st.write):
     epoch = Time(datetime.utcnow())
-    # ISS orbit
+    # Approximate ISS orbit
     iss_orbit = Orbit.from_classical(
         attractor=Earth,
         a=(Earth.R + 400*u.km),
@@ -116,7 +143,7 @@ def simulate_mission(debris_list, log_func=st.write):
         nu=0*u.deg,
         epoch=epoch
     )
-    # Create orbits for debris
+    # Build orbits for each piece of debris
     for d in debris_list:
         if d.get("line1") and d.get("line2"):
             orb = create_orbit_from_tle(d, epoch)
@@ -131,9 +158,10 @@ def simulate_mission(debris_list, log_func=st.write):
             inc = random.uniform(45,55)*u.deg
             d["orbit"] = Orbit.from_classical(Earth, Earth.R+alt, 0.001*u.one, inc,
                                               0*u.deg, 0*u.deg, 0*u.deg, epoch=epoch)
+
     debris_list.sort(key=lambda x: x["criticality"], reverse=True)
     target = debris_list[0]
-    log_func(f"**[MISSION] Selected target debris:** {target['name']} (Size={target['size']:.2f} m, Mass={target['mass']:.2f} kg)")
+    log_func(f"**[MISSION] Selected target debris:** {target['name']} (Size: {target['size']:.2f} m, Mass: {target['mass']:.2f} kg)")
 
     departure_time = epoch + 10*u.min
     arrival_time = departure_time + 40*u.min
@@ -147,108 +175,19 @@ def simulate_mission(debris_list, log_func=st.write):
     arr_dv = np.linalg.norm(debris_v - v_arr.to(u.km/u.s).value)
     total_dv = dep_dv + arr_dv
 
-    log_func(f"**[MISSION] Transfer orbit computed; transfer duration = {ttime:.2f} seconds**")
+    log_func(f"**[MISSION] Transfer orbit computed; duration = {ttime:.2f} s**")
     log_func(f"**[MISSION] Delta-v:** Dep = {dep_dv:.2f} km/s, Arr = {arr_dv:.2f} km/s, Total = {total_dv:.2f} km/s")
-    log_func(f"**[MISSION] Debris {target['name']} collected & crushed.**")
+    log_func("**[MISSION] Debris collected & crushed.**")
     log_func(f"**[RESULT] Mission complete. Δv={total_dv:.2f} km/s, time={ttime:.2f} s**")
 
     return iss_orbit, target["orbit"], departure_time, arrival_time
 
-# ------------------------------
-# Plotly 3D Earth + Orbits
-# ------------------------------
-def plot_mission_3d_interactive(iss_orbit, debris_orbit, departure_time, arrival_time):
-    """
-    Uses Plotly to create an interactive 3D scene with:
-      - Earth as a sphere
-      - ISS orbit (green)
-      - Debris orbit (red)
-      - Transfer path (orange dashed)
-    You can rotate and zoom this figure in the Streamlit UI.
-    """
-    # 1) Create Earth sphere with param grids
-    R_earth = Earth.R.to(u.km).value
-    n_u, n_v = 50, 50
-    u_vals = np.linspace(0, 2*np.pi, n_u)
-    v_vals = np.linspace(0, np.pi, n_v)
-    xs = R_earth * np.outer(np.cos(u_vals), np.sin(v_vals))
-    ys = R_earth * np.outer(np.sin(u_vals), np.sin(v_vals))
-    zs = R_earth * np.outer(np.ones_like(u_vals), np.cos(v_vals))
-
-    earth_surface = go.Surface(
-        x=xs, y=ys, z=zs,
-        colorscale="Blues",
-        opacity=0.3,
-        name="Earth"
-    )
-
-    # 2) Sample orbits
-    iss_pts = iss_orbit.sample(200)
-    iss_x = iss_pts.x.to(u.km).value
-    iss_y = iss_pts.y.to(u.km).value
-    iss_z = iss_pts.z.to(u.km).value
-
-    deb_pts = debris_orbit.sample(200)
-    deb_x = deb_pts.x.to(u.km).value
-    deb_y = deb_pts.y.to(u.km).value
-    deb_z = deb_pts.z.to(u.km).value
-
-    # 3) Transfer path by linear interpolation
-    t_vals = np.linspace(0, (arrival_time - departure_time).to(u.s).value, 100)
-    r_dep = iss_orbit.propagate(departure_time - iss_orbit.epoch).r.value
-    r_arr = debris_orbit.propagate(arrival_time - debris_orbit.epoch).r.value
-    transfer_xyz = []
-    for t in t_vals:
-        frac = t / t_vals[-1]
-        r = r_dep + frac * (r_arr - r_dep)
-        transfer_xyz.append(r)
-    transfer_xyz = np.array(transfer_xyz)
-    tr_x = transfer_xyz[:,0]
-    tr_y = transfer_xyz[:,1]
-    tr_z = transfer_xyz[:,2]
-
-    # 4) Create Scatter3d traces
-    iss_trace = go.Scatter3d(
-        x=iss_x, y=iss_y, z=iss_z,
-        mode='lines',
-        line=dict(color='green', width=3),
-        name="ISS Orbit"
-    )
-    debris_trace = go.Scatter3d(
-        x=deb_x, y=deb_y, z=deb_z,
-        mode='lines',
-        line=dict(color='red', width=3),
-        name="Debris Orbit"
-    )
-    transfer_trace = go.Scatter3d(
-        x=tr_x, y=tr_y, z=tr_z,
-        mode='lines',
-        line=dict(color='orange', width=3, dash='dot'),
-        name="Transfer"
-    )
-
-    # 5) Build the figure
-    fig = go.Figure(data=[earth_surface, iss_trace, debris_trace, transfer_trace])
-    fig.update_layout(
-        title="Debris Collector Mission (Interactive)",
-        scene=dict(
-            xaxis_title='X (km)',
-            yaxis_title='Y (km)',
-            zaxis_title='Z (km)',
-            aspectmode='data'
-        )
-    )
-    return fig
-
-# ------------------------------
-# Satellite Launch
-# ------------------------------
 def simulate_satellite_launch(lat_deg, lon_deg, alt_km, log_func=st.write):
     epoch = Time(datetime.utcnow())
     inc = abs(lat_deg)*u.deg
     if inc > 90*u.deg:
         inc = 90*u.deg
-    sat_orb = Orbit.from_classical(
+    sat_orbit = Orbit.from_classical(
         attractor=Earth,
         a=(Earth.R + alt_km*u.km),
         ecc=0.001*u.one,
@@ -258,114 +197,176 @@ def simulate_satellite_launch(lat_deg, lon_deg, alt_km, log_func=st.write):
         nu=0*u.deg,
         epoch=epoch
     )
-    log_func(f"**[SATELLITE] Launched from lat={lat_deg:.2f}, lon={lon_deg:.2f}, alt={alt_km} km => inc={inc}**")
-    return sat_orb
+    log_func(f"**[SATELLITE] Launched from Earth (lat: {lat_deg}°, lon: {lon_deg}°, alt: {alt_km} km, inc: {inc})**")
+    return sat_orbit
 
-def plot_satellite_orbit_3d_interactive(sat_orbit):
-    """
-    Similar to the mission plot, but only for the satellite orbit + Earth.
-    """
-    # Earth sphere
-    R_earth = Earth.R.to(u.km).value
+# -------------------------------------------------------------------
+# 6. Plotly 3D Interactive Visualization
+# -------------------------------------------------------------------
+def plot_mission_3d_interactive(iss_orbit, debris_orbit, departure_time, arrival_time):
+    R = Earth.R.to(u.km).value
     n_u, n_v = 50, 50
     u_vals = np.linspace(0, 2*np.pi, n_u)
     v_vals = np.linspace(0, np.pi, n_v)
-    xs = R_earth * np.outer(np.cos(u_vals), np.sin(v_vals))
-    ys = R_earth * np.outer(np.sin(u_vals), np.sin(v_vals))
-    zs = R_earth * np.outer(np.ones_like(u_vals), np.cos(v_vals))
+    X = R * np.outer(np.cos(u_vals), np.sin(v_vals))
+    Y = R * np.outer(np.sin(u_vals), np.sin(v_vals))
+    Z = R * np.outer(np.ones_like(u_vals), np.cos(v_vals))
 
     earth_surface = go.Surface(
-        x=xs, y=ys, z=zs,
+        x=X, y=Y, z=Z,
         colorscale="Blues",
         opacity=0.3,
         name="Earth"
     )
 
-    # Satellite orbit
-    pts = sat_orbit.sample(200)
-    sx = pts.x.to(u.km).value
-    sy = pts.y.to(u.km).value
-    sz = pts.z.to(u.km).value
+    # ISS orbit
+    iss_pts = iss_orbit.sample(200)
+    iss_trace = go.Scatter3d(
+        x=iss_pts.x.to(u.km).value,
+        y=iss_pts.y.to(u.km).value,
+        z=iss_pts.z.to(u.km).value,
+        mode="lines",
+        line=dict(color="green", width=3),
+        name="ISS Orbit"
+    )
+
+    # Debris orbit
+    debris_pts = debris_orbit.sample(200)
+    debris_trace = go.Scatter3d(
+        x=debris_pts.x.to(u.km).value,
+        y=debris_pts.y.to(u.km).value,
+        z=debris_pts.z.to(u.km).value,
+        mode="lines",
+        line=dict(color="red", width=3),
+        name="Debris Orbit"
+    )
+
+    # Transfer trajectory (linear interpolation)
+    t_vals = np.linspace(0, (arrival_time - departure_time).to(u.s).value, 100)
+    r_dep = iss_orbit.propagate(departure_time - iss_orbit.epoch).r.value
+    r_arr = debris_orbit.propagate(arrival_time - debris_orbit.epoch).r.value
+    transfer_xyz = []
+    for t in t_vals:
+        frac = t / t_vals[-1]
+        r = r_dep + frac * (r_arr - r_dep)
+        transfer_xyz.append(r)
+    transfer_xyz = np.array(transfer_xyz)
+    transfer_trace = go.Scatter3d(
+        x=transfer_xyz[:,0],
+        y=transfer_xyz[:,1],
+        z=transfer_xyz[:,2],
+        mode="lines",
+        line=dict(color="orange", width=3, dash="dot"),
+        name="Transfer Trajectory"
+    )
+
+    fig = go.Figure(data=[earth_surface, iss_trace, debris_trace, transfer_trace])
+    fig.update_layout(
+        title="Debris Collector Mission ",
+        scene=dict(
+            xaxis_title="X (km)",
+            yaxis_title="Y (km)",
+            zaxis_title="Z (km)",
+            aspectmode="data"
+        )
+    )
+    return fig
+
+def plot_satellite_orbit_3d_interactive(sat_orbit):
+    R = Earth.R.to(u.km).value
+    n_u, n_v = 50, 50
+    u_vals = np.linspace(0, 2*np.pi, n_u)
+    v_vals = np.linspace(0, np.pi, n_v)
+    X = R * np.outer(np.cos(u_vals), np.sin(v_vals))
+    Y = R * np.outer(np.sin(u_vals), np.sin(v_vals))
+    Z = R * np.outer(np.ones_like(u_vals), np.cos(v_vals))
+
+    earth_surface = go.Surface(
+        x=X, y=Y, z=Z,
+        colorscale="Blues",
+        opacity=0.3,
+        name="Earth"
+    )
+    sat_pts = sat_orbit.sample(200)
     sat_trace = go.Scatter3d(
-        x=sx, y=sy, z=sz,
-        mode='lines',
-        line=dict(color='magenta', width=3),
+        x=sat_pts.x.to(u.km).value,
+        y=sat_pts.y.to(u.km).value,
+        z=sat_pts.z.to(u.km).value,
+        mode="lines",
+        line=dict(color="magenta", width=3),
         name="Satellite Orbit"
     )
 
     fig = go.Figure(data=[earth_surface, sat_trace])
     fig.update_layout(
-        title="Satellite Orbit (Interactive)",
+        title="Satellite Orbit ",
         scene=dict(
-            xaxis_title='X (km)',
-            yaxis_title='Y (km)',
-            zaxis_title='Z (km)',
-            aspectmode='data'
+            xaxis_title="X (km)",
+            yaxis_title="Y (km)",
+            zaxis_title="Z (km)",
+            aspectmode="data"
         )
     )
     return fig
 
-# ------------------------------
-# Debris Map
-# ------------------------------
 def propagate_tles(tle_list):
     now = datetime.utcnow()
-    jd_now, fr_now = jday(now.year, now.month, now.day,
-                          now.hour, now.minute, now.second + now.microsecond*1e-6)
-    positions = []
-    for (nm, line1, line2) in tle_list:
+    jd_now, fr_now = jday(
+        now.year, now.month, now.day,
+        now.hour, now.minute,
+        now.second + now.microsecond*1e-6
+    )
+    pos_list = []
+    for (nm, l1, l2) in tle_list:
         try:
-            sat = Satrec.twoline2rv(line1, line2)
-            e, r, v = sat.sgp4(jd_now, fr_now)
+            s = Satrec.twoline2rv(l1, l2)
+            e, r, v = s.sgp4(jd_now, fr_now)
             if e == 0:
-                positions.append((nm, r[0], r[1], r[2]))
-        except:
+                pos_list.append((nm, r[0], r[1], r[2]))
+        except Exception:
             pass
-    return positions
+    return pos_list
 
 def plot_debris_map_3d_plotly(debris_positions):
-    R_earth = 6378.0
+    R = 6378.0
     n_u, n_v = 50, 50
     u_vals = np.linspace(0, 2*np.pi, n_u)
     v_vals = np.linspace(-np.pi/2, np.pi/2, n_v)
-    xs = R_earth * np.outer(np.cos(u_vals), np.cos(v_vals))
-    ys = R_earth * np.outer(np.sin(u_vals), np.cos(v_vals))
-    zs = R_earth * np.outer(np.ones_like(u_vals), np.sin(v_vals))
+    X = R * np.outer(np.cos(u_vals), np.cos(v_vals))
+    Y = R * np.outer(np.sin(u_vals), np.cos(v_vals))
+    Z = R * np.outer(np.ones_like(u_vals), np.sin(v_vals))
 
     earth_surf = go.Surface(
-        x=xs, y=ys, z=zs,
+        x=X, y=Y, z=Z,
         colorscale="Blues",
         opacity=0.3,
         name="Earth"
     )
-    xpts = [p[1] for p in debris_positions]
-    ypts = [p[2] for p in debris_positions]
-    zpts = [p[3] for p in debris_positions]
+    xs = [p[1] for p in debris_positions]
+    ys = [p[2] for p in debris_positions]
+    zs = [p[3] for p in debris_positions]
+
     debris_trace = go.Scatter3d(
-        x=xpts, y=ypts, z=zpts,
-        mode='markers',
-        marker=dict(size=2, color='red'),
-        name='Debris'
+        x=xs, y=ys, z=zs,
+        mode="markers",
+        marker=dict(size=2, color="red"),
+        name="Debris"
     )
     fig = go.Figure(data=[earth_surf, debris_trace])
     fig.update_layout(
-        title="Global Debris Map (Interactive)",
+        title="Global Debris Map ",
         scene=dict(
-            xaxis_title='X (km)',
-            yaxis_title='Y (km)',
-            zaxis_title='Z (km)',
-            aspectmode='data'
+            xaxis_title="X (km)",
+            yaxis_title="Y (km)",
+            zaxis_title="Z (km)",
+            aspectmode="data"
         )
     )
     return fig
 
-# ============================
-# Streamlit UI
-# ============================
-st.set_page_config(page_title="Debris & Satellite Simulation (Plotly)", layout="wide")
-st.title("🚀 Autonomous Debris Removal & Satellite Launch (Interactive Plotly)")
-
-# Use session_state to store data
+# -------------------------------------------------------------------
+# 7. Main UI: Buttons and Plotting
+# -------------------------------------------------------------------
 if 'debris_list' not in st.session_state:
     st.session_state.debris_list = None
 if 'iss_orbit' not in st.session_state:
@@ -379,19 +380,12 @@ if 'arr_time' not in st.session_state:
 if 'sat_orbit' not in st.session_state:
     st.session_state.sat_orbit = None
 
-# Sidebar for Satellite Launch Inputs
-st.sidebar.header("Satellite Launch Parameters")
-lat_input = st.sidebar.text_input("Launch Latitude (°)", "28.5")
-lon_input = st.sidebar.text_input("Launch Longitude (°)", "-80.6")
-alt_input = st.sidebar.text_input("Launch Altitude (km)", "500")
-
-# Buttons
 if st.sidebar.button("Fetch Debris TLE"):
-    st.write("**[API] Fetching debris TLE data...**")
+    st.markdown("**[API] Fetching debris TLE data...**")
     debris = fetch_debris_tle()
     if debris:
         st.session_state.debris_list = assign_debris_size_and_criticality(debris)
-        st.write(f"**[API] Fetched {len(st.session_state.debris_list)} debris objects.**")
+        st.markdown(f"**[API] Fetched {len(st.session_state.debris_list)} debris objects.**")
         for d in st.session_state.debris_list:
             st.write(f"* {d['name']}: size={d['size']:.2f} m, mass={d['mass']:.2f} kg, crit={d['criticality']:.2f}")
     else:
@@ -401,14 +395,17 @@ if st.sidebar.button("Simulate Debris Mission"):
     if st.session_state.debris_list is None:
         st.error("No debris data. Please fetch debris TLE first!")
     else:
-        st.write("**[MISSION] Simulating debris-collector mission from ISS...**")
-        iss_orb, deb_orb, dep_t, arr_t = simulate_mission(st.session_state.debris_list, log_func=st.write)
-        st.session_state.iss_orbit = iss_orb
-        st.session_state.debris_orbit = deb_orb
-        st.session_state.dep_time = dep_t
-        st.session_state.arr_time = arr_t
-        # Use Plotly figure
-        fig = plot_mission_3d_interactive(iss_orb, deb_orb, dep_t, arr_t)
+        st.markdown("**[MISSION] Simulating debris-collector mission from ISS...**")
+        iss_orbit, debris_orbit, dep_time, arr_time = simulate_mission(
+            st.session_state.debris_list, 
+            log_func=st.markdown
+        )
+        st.session_state.iss_orbit = iss_orbit
+        st.session_state.debris_orbit = debris_orbit
+        st.session_state.dep_time = dep_time
+        st.session_state.arr_time = arr_time
+
+        fig = plot_mission_3d_interactive(iss_orbit, debris_orbit, dep_time, arr_time)
         st.plotly_chart(fig, use_container_width=True)
 
 if st.sidebar.button("Simulate Satellite Launch"):
@@ -416,30 +413,38 @@ if st.sidebar.button("Simulate Satellite Launch"):
         lat_val = float(lat_input)
         lon_val = float(lon_input)
         alt_val = float(alt_input)
-    except:
-        st.error("Invalid lat/lon/alt.")
+    except Exception:
+        st.error("Invalid input for latitude, longitude, or altitude.")
     else:
-        st.write("**[SATELLITE] Simulating satellite launch...**")
-        sat_orb = simulate_satellite_launch(lat_val, lon_val, alt_val, log_func=st.write)
-        st.session_state.sat_orbit = sat_orb
-        fig_sat = plot_satellite_orbit_3d_interactive(sat_orb)
+        st.markdown("**[SATELLITE] Simulating satellite launch...**")
+        sat_orbit = simulate_satellite_launch(lat_val, lon_val, alt_val, log_func=st.markdown)
+        st.session_state.sat_orbit = sat_orbit
+
+        fig_sat = plot_satellite_orbit_3d_interactive(sat_orbit)
         st.plotly_chart(fig_sat, use_container_width=True)
 
 if st.sidebar.button("Plot Global Debris Map"):
     if st.session_state.debris_list is None:
         st.error("No debris data. Please fetch debris TLE first!")
     else:
-        tle_list = [(d["name"], d["line1"], d["line2"]) for d in st.session_state.debris_list if d["line1"] and d["line2"]]
+        tle_list = [
+            (d["name"], d["line1"], d["line2"]) 
+            for d in st.session_state.debris_list 
+            if d["line1"] and d["line2"]
+        ]
         positions = propagate_tles(tle_list)
-        st.write(f"Propagated {len(positions)} debris objects to current time.")
-        fig_globe = plot_debris_map_3d_plotly(positions)
-        st.plotly_chart(fig_globe, use_container_width=True)
+        st.markdown(f"**[INFO] Propagated {len(positions)} debris objects to current time.**")
+        fig_deb = plot_debris_map_3d_plotly(positions)
+        st.plotly_chart(fig_deb, use_container_width=True)
 
+# -------------------------------------------------------------------
+# 8. Instructions / Footer
+# -------------------------------------------------------------------
 st.markdown("### Instructions")
 st.markdown("""
-1. **Fetch Debris TLE**: Retrieves debris data and assigns size/mass.
-2. **Simulate Debris Mission**: Computes the ISS→debris transfer trajectory and displays an **interactive 3D** Plotly figure you can rotate.
-3. **Simulate Satellite Launch**: Creates a naive orbit from lat/lon/alt, also displayed in a 3D Plotly figure.
-4. **Plot Global Debris Map**: 3D Plotly globe with debris points.
-5. **Rotate**: Click and drag in each figure to rotate/zoom in real time.
+1. **Fetch Debris TLE**: Retrieves debris data and assigns size/mass.  
+2. **Simulate Debris Mission**: Computes the ISS→debris transfer trajectory and displays an interactive 3D Plotly figure you can rotate.  
+3. **Simulate Satellite Launch**: Generates a satellite orbit based on your launch parameters and displays it interactively.  
+4. **Plot Global Debris Map**: Shows a 3D interactive globe with debris scatter points.  
+5. **Rotate**: Use your mouse to click and drag in each figure to rotate/zoom in real time.
 """)
