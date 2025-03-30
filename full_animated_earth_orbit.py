@@ -1,226 +1,359 @@
-import requests
-import numpy as np
+import streamlit as st
+import sys
+import os
+import math
 import random
-import time
+import numpy as np
+import requests
 from datetime import datetime
+
+# Astropy / Poliastro imports
+from astropy import units as u
+from astropy.time import Time
+from poliastro.bodies import Earth
+from poliastro.twobody import Orbit
+from poliastro.iod import izzo
+
+# SGP4 imports
 from sgp4.api import Satrec, jday
+
+# Matplotlib imports
+import matplotlib
+matplotlib.use("Agg")  # Use non-interactive backend for Streamlit
 import matplotlib.pyplot as plt
 
-# ---------------------------
-# Data Structures and Classes
-# ---------------------------
-class Debris:
-    """
-    Represents a space debris object with its TLE data.
-    A simulated "size" is assigned (as a proxy for its collision risk).
-    """
-    def __init__(self, name, tle_line1, tle_line2):
-        self.name = name
-        self.tle_line1 = tle_line1
-        self.tle_line2 = tle_line2
-        self.satrec = Satrec.twoline2rv(tle_line1, tle_line2)
-        self.size = None            # To be set by the AI (in arbitrary units)
-        self.criticality_score = None
+# ============================
+# GLOBAL SETTINGS and API URLs
+# ============================
+DEBRIS_TLE_URL = "https://celestrak.org/NORAD/elements/supplemental/sup-gp.php?CATNR=25544&FORMAT=TLE"
+ISS_TLE_URL    = "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=TLE"
+MAX_OBJECTS = 500
 
-    def propagate(self, dt_minutes):
-        """
-        Propagates the orbit using SGP4 for a given dt (in minutes).
-        Returns position and velocity (in km and km/s).
-        """
-        now = datetime.utcnow()
-        jd, fr = jday(now.year, now.month, now.day, now.hour, now.minute, now.second)
-        error_code, pos, vel = self.satrec.sgp4(jd, fr)
-        return pos, vel
+# ============================
+# Helper Functions (Same as Before)
+# ============================
 
+def ai_detect_debris_size(image_path):
+    # Simulate image processing: return random size in meters
+    st.info(f"Simulating AI detection for image: {image_path}")
+    return random.uniform(0.5, 2.0)
 
-class TrajectoryOptimizer:
-    """
-    AI agent to evaluate debris criticality.
-    Given a launch point (e.g. Cape Canaveral) and a list of debris,
-    it calculates a criticality score for each debris object based on its size and estimated proximity.
-    """
-    def __init__(self, launch_coords):
-        # launch_coords as a tuple: (latitude, longitude)
-        self.launch_coords = launch_coords
-
-    def compute_criticality(self, debris, launch_coords):
-        # For simulation: assign a random current location to the debris.
-        debris_location = (random.uniform(-90, 90), random.uniform(-180, 180))
-        lat1, lon1 = launch_coords
-        lat2, lon2 = debris_location
-        # Simple (Euclidean) distance (note: for demonstration only)
-        distance = np.sqrt((lat1 - lat2) ** 2 + (lon1 - lon2) ** 2)
-        # If size not set, assign a random size (scale 1 to 10)
-        if debris.size is None:
-            debris.size = random.uniform(1, 10)
-        # Higher score means higher risk: large debris closer to the launch path are prioritized.
-        score = debris.size / (distance + 1)  # add 1 to avoid division by zero
-        return score, debris_location
-
-    def identify_critical_debris(self, debris_list):
-        prioritized = []
-        for d in debris_list:
-            score, location = self.compute_criticality(d, self.launch_coords)
-            d.criticality_score = score
-            prioritized.append((d, score, location))
-        # Sort debris in descending order (most critical first)
-        prioritized.sort(key=lambda x: x[1], reverse=True)
-        return prioritized
-
-
-class NavigationAgent:
-    """
-    Plans a simple trajectory as a series of waypoints from a start to a target.
-    In a real-world system, this would use orbital mechanics and collision avoidance algorithms.
-    """
-    def plan_trajectory(self, start_coords, target_coords):
-        # Both coordinates are tuples: (latitude, longitude, altitude)
-        lat1, lon1, alt1 = start_coords
-        lat2, lon2, alt2 = target_coords
-        waypoints = []
-        steps = 10
-        for i in range(steps + 1):
-            lat = lat1 + (lat2 - lat1) * i / steps
-            lon = lon1 + (lon2 - lon1) * i / steps
-            alt = alt1 + (alt2 - alt1) * i / steps
-            waypoints.append((lat, lon, alt))
-        return waypoints
-
-
-class ExecutionAgent:
-    """
-    Controls the physical dispatch of the debris collector.
-    Simulates movement along the planned waypoints.
-    """
-    def execute_mission(self, trajectory):
-        for wp in trajectory:
-            print(f"Debris collector moving to waypoint: {wp}")
-            time.sleep(0.1)  # Simulate transit delay
-        print("Debris collector reached target. Commencing debris collection...")
-        time.sleep(1)  # Simulate debris collection process
-        print("Debris collected. Initiating return trajectory...")
-        time.sleep(1)
-        print("Debris collector returned to ISS successfully.")
-
-
-class CommunicationAgent:
-    """
-    Handles mission logging and status communications.
-    """
-    def send_message(self, message):
-        print(f"[COMMUNICATION] {message}")
-
-
-# ---------------------------
-# Helper Functions
-# ---------------------------
 def fetch_tle_data(url):
-    """
-    Fetches TLE data from a given URL.
-    Expects at least 3 lines: name, line1, line2.
-    """
-    response = requests.get(url)
-    lines = response.text.strip().splitlines()
-    if len(lines) >= 3:
-        return lines[0], lines[1], lines[2]
-    return None, None, None
+    try:
+        resp = requests.get(url, timeout=10)
+        lines = resp.text.strip().splitlines()
+        if len(lines) >= 3:
+            return lines[0], lines[1], lines[2]
+        else:
+            return None, None, None
+    except Exception as e:
+        st.error(f"Error fetching TLE data: {e}")
+        return None, None, None
 
+def fetch_debris_tle():
+    debris_list = []
+    try:
+        resp = requests.get(DEBRIS_TLE_URL, timeout=10)
+        resp.raise_for_status()
+        lines = resp.text.strip().splitlines()
+        for i in range(0, len(lines), 3):
+            if i+2 < len(lines):
+                name = lines[i].strip()
+                line1 = lines[i+1].strip()
+                line2 = lines[i+2].strip()
+                debris_list.append({
+                    "name": name,
+                    "line1": line1,
+                    "line2": line2
+                })
+        debris_list = debris_list[:MAX_OBJECTS]
+    except Exception as e:
+        st.error(f"Error fetching debris TLE: {e}")
+    return debris_list
 
-def fetch_debris_list(url, num_objects=5):
-    """
-    Fetches debris TLEs from a given URL.
-    Returns a list of Debris objects; defaults to a few objects for simulation.
-    """
-    response = requests.get(url)
-    lines = response.text.strip().splitlines()
-    debris_objects = []
-    # Each debris object is represented by 3 lines (name + 2 TLE lines)
-    for i in range(0, min(num_objects * 3, len(lines)), 3):
-        if i + 2 < len(lines):
-            name = lines[i].strip()
-            line1 = lines[i + 1].strip()
-            line2 = lines[i + 2].strip()
-            debris_objects.append(Debris(name, line1, line2))
-    return debris_objects
+def fetch_debris_mass(debris):
+    # Simulate external mass query: return random mass (kg)
+    debris["mass"] = random.uniform(0, 20)
+    return debris
 
+def assign_debris_size_and_criticality(debris_list):
+    for d in debris_list:
+        image_path = f"images/{d['name'].replace(' ', '_')}.jpg"
+        d["size"] = ai_detect_debris_size(image_path)
+        d = fetch_debris_mass(d)
+        d["criticality"] = d["size"] + d["mass"] / 1000.0
+    return debris_list
 
-def visualize_trajectory(traj_to, traj_return):
-    """
-    Plots a simple 2D visualization (latitude vs. longitude) of the outbound and return trajectories.
-    """
-    to_lats = [wp[0] for wp in traj_to]
-    to_lons = [wp[1] for wp in traj_to]
-    ret_lats = [wp[0] for wp in traj_return]
-    ret_lons = [wp[1] for wp in traj_return]
+def create_orbit_from_tle(debris, epoch):
+    try:
+        sat = Satrec.twoline2rv(debris["line1"], debris["line2"])
+        jd, fr = jday(epoch.datetime.year, epoch.datetime.month, epoch.datetime.day,
+                      epoch.datetime.hour, epoch.datetime.minute,
+                      epoch.datetime.second + epoch.datetime.microsecond*1e-6)
+        error, r, v = sat.sgp4(jd, fr)
+        if error != 0:
+            st.warning(f"sgp4 error for {debris['name']}: code {error}")
+            raise ValueError("Propagation error")
+        r = np.array(r) * u.km
+        v = np.array(v) * (u.km / u.s)
+        orbit = Orbit.from_vectors(Earth, r, v, epoch=epoch)
+        return orbit
+    except Exception as e:
+        st.error(f"Error creating orbit for {debris['name']}: {e}")
+        return None
 
-    plt.figure(figsize=(8, 6))
-    plt.plot(to_lons, to_lats, 'bo-', label="To Target")
-    plt.plot(ret_lons, ret_lats, 'ro-', label="Return")
-    plt.xlabel("Longitude (°)")
-    plt.ylabel("Latitude (°)")
-    plt.title("Simulated Trajectory of Debris Collector")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+def compute_transfer_orbit(iss_orbit, debris_orbit, departure_time, arrival_time):
+    r1 = iss_orbit.propagate(departure_time - iss_orbit.epoch).r
+    r2 = debris_orbit.propagate(arrival_time - debris_orbit.epoch).r
+    (v1, v2), = izzo.lambert(Earth.k, r1, r2, (arrival_time - departure_time).to(u.s))
+    return v1, v2, r1, r2
 
-
-# ---------------------------
-# Main System Flow
-# ---------------------------
-def main():
-    # Initialize Communication
-    comms = CommunicationAgent()
-    comms.send_message("Mission initiated: Autonomous Debris Removal System online.")
-
-    # Step 1: Retrieve ISS TLE data (starting point for the debris collector)
-    iss_tle_url = "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=TLE"
-    iss_name, iss_line1, iss_line2 = fetch_tle_data(iss_tle_url)
-    comms.send_message(f"ISS TLE data fetched: {iss_name}")
-    # For simulation, set ISS coordinates (latitude, longitude, altitude in km)
-    iss_coords = (0.0, 0.0, 408)  # Example: 408 km altitude
-
-    # Step 2: Fetch debris data from Celestrak
-    debris_tle_url = "https://celestrak.org/NORAD/elements/iridium-33-debris.txt"
-    debris_list = fetch_debris_list(debris_tle_url, num_objects=5)
-    comms.send_message(f"Fetched {len(debris_list)} debris objects from Celestrak.")
-
-    # Step 3: Run the AI agent to prioritize debris based on a criticality score.
-    # Assume a launch mission from Cape Canaveral (28.5° N, -80.6° W)
-    launch_coords = (28.5, -80.6)
-    trajectory_optimizer = TrajectoryOptimizer(launch_coords)
-    prioritized_debris = trajectory_optimizer.identify_critical_debris(debris_list)
-
-    comms.send_message("Prioritizing debris based on criticality score...")
-    for d, score, location in prioritized_debris:
-        comms.send_message(
-            f"Debris: {d.name}, Size: {d.size:.2f}, Score: {score:.2f}, Estimated Location: {location}"
-        )
-
-    # Choose the highest-priority debris object as the target.
-    target_debris, target_score, debris_location = prioritized_debris[0]
-    comms.send_message(
-        f"Selected target debris: {target_debris.name} with criticality score: {target_score:.2f}"
+def simulate_mission(debris_list, log_func=st.write):
+    epoch = Time(datetime.utcnow())
+    # Define a realistic ISS orbit (approx. 400 km altitude, 51.6° inclination)
+    iss_orbit = Orbit.from_classical(
+        attractor=Earth,
+        a=(Earth.R + 400*u.km),
+        ecc=0.001*u.one,
+        inc=51.6*u.deg,
+        raan=0*u.deg,
+        argp=0*u.deg,
+        nu=0*u.deg,
+        epoch=epoch
     )
+    # For each debris, try to create an orbit; otherwise, simulate one.
+    for d in debris_list:
+        if d.get("line1") and d.get("line2"):
+            orb = create_orbit_from_tle(d, epoch)
+            if orb is None:
+                alt = random.uniform(350,450)*u.km
+                inc = random.uniform(45,55)*u.deg
+                orb = Orbit.from_classical(Earth, Earth.R+alt, 0.001*u.one, inc,
+                                           0*u.deg, 0*u.deg, 0*u.deg, epoch=epoch)
+            d["orbit"] = orb
+        else:
+            alt = random.uniform(350,450)*u.km
+            inc = random.uniform(45,55)*u.deg
+            d["orbit"] = Orbit.from_classical(Earth, Earth.R+alt, 0.001*u.one, inc,
+                                              0*u.deg, 0*u.deg, 0*u.deg, epoch=epoch)
+    # Sort by descending criticality
+    debris_list.sort(key=lambda x: x["criticality"], reverse=True)
+    target = debris_list[0]
+    log_func(f"**[MISSION] Target debris:** {target['name']} (Size={target['size']:.2f} m, Mass={target['mass']:.2f} kg)")
+    departure_time = epoch + 10*u.min
+    arrival_time = departure_time + 40*u.min
+    v_dep, v_arr, r_dep, r_arr = compute_transfer_orbit(iss_orbit, target["orbit"], departure_time, arrival_time)
+    ttime = (arrival_time - departure_time).to(u.s).value
+    iss_v = iss_orbit.v.to(u.km/u.s).value
+    dep_dv = np.linalg.norm(v_dep.to(u.km/u.s).value - iss_v)
+    debris_v = target["orbit"].v.to(u.km/u.s).value
+    arr_dv = np.linalg.norm(debris_v - v_arr.to(u.km/u.s).value)
+    total_dv = dep_dv + arr_dv
+    log_func(f"**[MISSION] Transfer time:** {ttime:.2f} s")
+    log_func(f"**[MISSION] Delta-v:** Dep = {dep_dv:.2f} km/s, Arr = {arr_dv:.2f} km/s, Total = {total_dv:.2f} km/s")
+    log_func("**[MISSION] Debris collected and crushed.**")
+    return iss_orbit, target["orbit"], departure_time, arrival_time
 
-    # For simulation, assume the debris altitude is 800 km.
-    target_coords = (debris_location[0], debris_location[1], 800)
+def plot_mission_3d(iss_orbit, debris_orbit, departure_time, arrival_time):
+    fig = plt.figure(figsize=(9,7))
+    ax = fig.add_subplot(111, projection='3d')
+    R_earth = Earth.R.to(u.km).value
+    u_vals = np.linspace(0, 2*np.pi, 60)
+    v_vals = np.linspace(0, np.pi, 30)
+    X = R_earth * np.outer(np.cos(u_vals), np.sin(v_vals))
+    Y = R_earth * np.outer(np.sin(u_vals), np.sin(v_vals))
+    Z = R_earth * np.outer(np.ones_like(u_vals), np.cos(v_vals))
+    ax.plot_surface(X, Y, Z, color='b', alpha=0.3)
+    # ISS orbit
+    iss_points = iss_orbit.sample(200)
+    ax.plot(iss_points.x.to(u.km).value,
+            iss_points.y.to(u.km).value,
+            iss_points.z.to(u.km).value,
+            color='green', label="ISS Orbit")
+    # Debris orbit
+    debris_points = debris_orbit.sample(200)
+    ax.plot(debris_points.x.to(u.km).value,
+            debris_points.y.to(u.km).value,
+            debris_points.z.to(u.km).value,
+            color='red', label="Debris Orbit")
+    # Transfer trajectory (linear interpolation)
+    t_vals = np.linspace(0, (arrival_time - departure_time).to(u.s).value, 100)
+    r_dep = iss_orbit.propagate(departure_time - iss_orbit.epoch).r.value
+    r_arr = debris_orbit.propagate(arrival_time - debris_orbit.epoch).r.value
+    transfer_points = []
+    for t in t_vals:
+        r = r_dep + (r_arr - r_dep) * (t / t_vals[-1])
+        transfer_points.append(r)
+    transfer_points = np.array(transfer_points)
+    ax.plot(transfer_points[:,0], transfer_points[:,1], transfer_points[:,2],
+            color='orange', linestyle='--', label="Transfer")
+    ax.set_title("Debris Collector Mission")
+    ax.set_xlabel("X (km)"); ax.set_ylabel("Y (km)"); ax.set_zlabel("Z (km)")
+    max_r = 1.5*R_earth
+    ax.set_xlim([-max_r, max_r]); ax.set_ylim([-max_r, max_r]); ax.set_zlim([-max_r, max_r])
+    ax.legend()
+    return fig
 
-    # Step 4: Plan the trajectory from ISS to the target debris and back.
-    nav_agent = NavigationAgent()
-    trajectory_to_target = nav_agent.plan_trajectory(iss_coords, target_coords)
-    trajectory_return = nav_agent.plan_trajectory(target_coords, iss_coords)
-    comms.send_message("Trajectory planned from ISS to target debris and back.")
+def simulate_satellite_launch(lat_deg, lon_deg, altitude_km, log_func=st.write):
+    epoch = Time(datetime.utcnow())
+    # Naively set inclination = |lat| (for demonstration)
+    inc = abs(lat_deg)*u.deg
+    if inc > 90*u.deg:
+        inc = 90*u.deg
+    sat_orbit = Orbit.from_classical(
+        attractor=Earth,
+        a=(Earth.R + altitude_km*u.km),
+        ecc=0.001*u.one,
+        inc=inc,
+        raan=0*u.deg,
+        argp=0*u.deg,
+        nu=0*u.deg,
+        epoch=epoch
+    )
+    log_func(f"**[SATELLITE] Launched:** lat={lat_deg:.2f}°, lon={lon_deg:.2f}°, alt={altitude_km} km → inc={inc}")
+    return sat_orbit
 
-    # Step 5: Dispatch the debris collector along the planned trajectories.
-    exec_agent = ExecutionAgent()
-    comms.send_message("Dispatching debris collector to target debris...")
-    exec_agent.execute_mission(trajectory_to_target)
-    exec_agent.execute_mission(trajectory_return)
-    comms.send_message("Mission completed: Debris collected and returned to ISS.")
+def plot_satellite_orbit_3d(sat_orbit, title="Satellite Orbit"):
+    fig = plt.figure(figsize=(9,7))
+    ax = fig.add_subplot(111, projection='3d')
+    R_earth = Earth.R.to(u.km).value
+    u_vals = np.linspace(0, 2*np.pi, 60)
+    v_vals = np.linspace(0, np.pi, 30)
+    X = R_earth * np.outer(np.cos(u_vals), np.sin(v_vals))
+    Y = R_earth * np.outer(np.sin(u_vals), np.sin(v_vals))
+    Z = R_earth * np.outer(np.ones_like(u_vals), np.cos(v_vals))
+    ax.plot_surface(X, Y, Z, color='b', alpha=0.3)
+    pts = sat_orbit.sample(200)
+    ax.plot(pts.x.to(u.km).value,
+            pts.y.to(u.km).value,
+            pts.z.to(u.km).value,
+            color='magenta', label="Satellite Orbit")
+    ax.set_title(title)
+    ax.set_xlabel("X (km)"); ax.set_ylabel("Y (km)"); ax.set_zlabel("Z (km)")
+    max_r = 1.5*R_earth
+    ax.set_xlim([-max_r, max_r]); ax.set_ylim([-max_r, max_r]); ax.set_zlim([-max_r, max_r])
+    ax.legend()
+    return fig
 
-    # Optional: Visualize the planned trajectories.
-    visualize_trajectory(trajectory_to_target, trajectory_return)
+def propagate_tles(tle_list):
+    now = datetime.utcnow()
+    jd_now, fr_now = jday(now.year, now.month, now.day, now.hour, now.minute, now.second+now.microsecond*1e-6)
+    pos_list = []
+    for (nm, l1, l2) in tle_list:
+        try:
+            s = Satrec.twoline2rv(l1, l2)
+            e, r, v = s.sgp4(jd_now, fr_now)
+            if e == 0:
+                pos_list.append((nm, r[0], r[1], r[2]))
+        except Exception:
+            pass
+    return pos_list
 
+def plot_debris_globe(debris_positions):
+    fig = plt.figure(figsize=(9,7))
+    ax = fig.add_subplot(111, projection='3d')
+    R_earth = 6378.0
+    u_vals = np.linspace(0, 2*np.pi, 60)
+    v_vals = np.linspace(-np.pi/2, np.pi/2, 30)
+    X = R_earth * np.outer(np.cos(u_vals), np.cos(v_vals))
+    Y = R_earth * np.outer(np.sin(u_vals), np.cos(v_vals))
+    Z = R_earth * np.outer(np.ones_like(u_vals), np.sin(v_vals))
+    ax.plot_surface(X, Y, Z, color='blue', alpha=0.3)
+    xs = [p[1] for p in debris_positions]
+    ys = [p[2] for p in debris_positions]
+    zs = [p[3] for p in debris_positions]
+    ax.scatter(xs, ys, zs, s=2, color='red', alpha=0.5, label='Debris')
+    ax.set_title("Global Debris Map")
+    ax.set_xlabel("X (km)"); ax.set_ylabel("Y (km)"); ax.set_zlabel("Z (km)")
+    mr = 1.2*max(max(np.abs(xs)) if xs else R_earth, max(np.abs(ys)) if ys else R_earth, max(np.abs(zs)) if zs else R_earth, R_earth)
+    ax.set_xlim([-mr, mr]); ax.set_ylim([-mr, mr]); ax.set_zlim([-mr, mr])
+    ax.legend()
+    return fig
 
-if __name__ == '__main__':
-    main()
+# ============================
+# Streamlit UI
+# ============================
+st.set_page_config(page_title="Debris & Satellite Simulation", layout="wide")
+
+st.title("🚀 Autonomous Debris Removal & Satellite Launch Simulation")
+
+# Use Streamlit's session_state to store data across interactions
+if 'debris_list' not in st.session_state:
+    st.session_state.debris_list = None
+if 'iss_orbit' not in st.session_state:
+    st.session_state.iss_orbit = None
+if 'debris_orbit' not in st.session_state:
+    st.session_state.debris_orbit = None
+if 'dep_time' not in st.session_state:
+    st.session_state.dep_time = None
+if 'arr_time' not in st.session_state:
+    st.session_state.arr_time = None
+if 'sat_orbit' not in st.session_state:
+    st.session_state.sat_orbit = None
+
+# Sidebar for Satellite Launch Inputs
+st.sidebar.header("Satellite Launch Parameters")
+lat_input = st.sidebar.text_input("Launch Latitude (°)", "28.5")
+lon_input = st.sidebar.text_input("Launch Longitude (°)", "-80.6")
+alt_input = st.sidebar.text_input("Launch Altitude (km)", "500")
+
+# Sidebar Buttons
+if st.sidebar.button("Fetch Debris TLE"):
+    st.write("**Fetching debris TLE data...**")
+    debris = fetch_debris_tle()
+    if debris:
+        st.session_state.debris_list = assign_debris_size_and_criticality(debris)
+        st.write(f"Fetched {len(st.session_state.debris_list)} debris objects.")
+        for d in st.session_state.debris_list:
+            st.write(f"*{d['name']}*: size={d['size']:.2f} m, mass={d['mass']:.2f} kg, crit={d['criticality']:.2f}")
+    else:
+        st.error("No debris TLE data fetched.")
+
+if st.sidebar.button("Simulate Debris Mission"):
+    if st.session_state.debris_list is None:
+        st.error("Please fetch debris data first!")
+    else:
+        st.write("**Simulating debris-collector mission from ISS...**")
+        iss_orbit, debris_orbit, dep_time, arr_time = simulate_mission(st.session_state.debris_list, log_func=st.write)
+        st.session_state.iss_orbit = iss_orbit
+        st.session_state.debris_orbit = debris_orbit
+        st.session_state.dep_time = dep_time
+        st.session_state.arr_time = arr_time
+        fig = plot_mission_3d(iss_orbit, debris_orbit, dep_time, arr_time)
+        st.pyplot(fig)
+
+if st.sidebar.button("Simulate Satellite Launch"):
+    try:
+        lat_val = float(lat_input)
+        lon_val = float(lon_input)
+        alt_val = float(alt_input)
+    except Exception as e:
+        st.error("Invalid input for latitude, longitude, or altitude.")
+    else:
+        st.write("**Simulating satellite launch...**")
+        sat_orbit = simulate_satellite_launch(lat_val, lon_val, alt_val, log_func=st.write)
+        st.session_state.sat_orbit = sat_orbit
+        fig_sat = plot_satellite_orbit_3d(sat_orbit, title="Satellite Orbit from Launch Site")
+        st.pyplot(fig_sat)
+
+if st.sidebar.button("Plot Global Debris Map"):
+    if st.session_state.debris_list is None:
+        st.error("Fetch debris data first!")
+    else:
+        tle_list = [(d["name"], d["line1"], d["line2"]) for d in st.session_state.debris_list if d["line1"] and d["line2"]]
+        positions = propagate_tles(tle_list)
+        st.write(f"Propagated {len(positions)} debris objects to current time.")
+        fig_globe = plot_debris_globe(positions)
+        st.pyplot(fig_globe)
+
+# Main area: you can also show logs or instructions
+st.markdown("### Instructions")
+st.markdown(
+    """
+    1. Use the **Sidebar** to input your launch parameters.
+    2. Click **Fetch Debris TLE** to retrieve and process debris data.
+    3. Click **Simulate Debris Mission** to compute the ISS-to-debris transfer trajectory.
+    4. Click **Simulate Satellite Launch** to see the orbit of a satellite launched from your chosen site.
+    5. Click **Plot Global Debris Map** to view a 3D map of debris.
+    """
+)
