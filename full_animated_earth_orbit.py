@@ -293,7 +293,7 @@ def plot_satellite_orbit_3d_interactive(sat_orbit):
         y=sat_pts.y.to(u.km).value,
         z=sat_pts.z.to(u.km).value,
         mode="lines",
-        line=dict(color="magenta", width=3),
+        line=dict(color="magenta", width=4),
         name="Satellite Orbit"
     )
 
